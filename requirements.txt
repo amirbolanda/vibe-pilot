@@ -1,0 +1,9 @@
+# Fallback if the app runs out of memory: no torch / sentence-transformers -> the engine switches to its TF-IDF backend (a bit less accurate).
+# Rename this file to requirements.txt in the GitHub repo.
+streamlit
+pandas
+numpy
+openpyxl
+scikit-learn
+scipy
+huggingface_hub==0.25.2
