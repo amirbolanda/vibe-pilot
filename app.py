@@ -57,7 +57,10 @@ def load():
     if not os.path.exists('VIBE_final_v25.xlsx'): persist.fetch('VIBE_final_v25.xlsx')      # deployed: the workbook lives in a private repo
     return Engine('VIBE_final_v25.xlsx')
 e = load()
-if 'user' not in st.session_state: st.session_state.user = fb.new_user()
+if 'user' not in st.session_state:
+    st.session_state.user = fb.new_user()
+    _g = str(st.query_params.get('g', ''))[:20]                          # invitation group from the link, e.g. ?g=A
+    fb.log_visit(st.session_state.user, _g, '')
 E = lambda x: html.escape(str(x))
 lang_sel = st.radio("Language / زبان", ["English", "فارسی"], horizontal=True, key='lang_sel')
 FA = lang_sel == "فارسی"
@@ -185,10 +188,16 @@ q = st.text_input("query", key="q_" + mode, label_visibility="collapsed")
 if q.strip():
     r = e.recommend(q.strip(), gender=gender, mode=mode, lang='fa' if FA else 'en')
     if r.get('corrected_query'): st.caption(L(f"Showing results for “{r['corrected_query']}”", f"نتایج برای «{r['corrected_query']}»"))
+    if r['case'] == 'perfume_missing' and r.get('brand_only'):
+        st.subheader(L(f"{r['brand']} perfumes in our library", f"عطرهای {r['brand']} در کتابخانه‌ی ما"))
+        st.write(' · '.join(r['same_brand']))
+        st.caption(L("Type one of these names to see its vibes and similar perfumes.", "اسم یکی از این‌ها را بنویسید تا وایب‌ها و عطرهای مشابهش را ببینید."))
+        st.stop()
     if r['case'] == 'perfume_missing':
         if st.session_state.get('miss_q') != q: fb.log_missing(st.session_state.user, q.strip(), r['brand']); st.session_state.miss_q = q
         st.subheader(L("We don't have this perfume yet", "این عطر هنوز در کتابخانه‌ی ما نیست"))
-        st.write(L("We've noted it, so we can add it. In the meantime:", "یادداشتش کردیم تا اضافه‌اش کنیم. تا آن موقع:"))
+        st.success(L("✓ We've noted it, so we can add it to our library.", "✓ یادداشتش کردیم تا به کتابخانه‌مان اضافه شود."))
+        st.write(L("In the meantime:", "تا آن موقع:"))
         if r['did_you_mean']: st.write(L('**Did you mean:** ', '**شاید منظورتان این بود:** ') + ' · '.join(n for n, _ in r['did_you_mean']))
         if r['same_brand']: st.write(L(f"**Other {r['brand']} perfumes we have:** ", f"**عطرهای دیگر {r['brand']} که داریم:** ") + ' · '.join(r['same_brand']))
         st.markdown(L("Describe how it smells or the mood you want from it (a few words)", "بوی آن یا حال‌وهوایی که از آن می‌خواهید را چند کلمه توصیف کنید"))
@@ -199,6 +208,15 @@ if q.strip():
     _src = r.get('perfume_card') if r['case'] == 'perfume' else (r['perfumes'][0] if r.get('perfumes') else None)
     PAL = palette(_src.get('axes')) if _src else PAL
     st.markdown(f"<style>.stApp{{background:radial-gradient(900px 520px at 12% -6%,{rgba(PAL[0], .30)},transparent 62%),radial-gradient(800px 520px at 100% 8%,{rgba(PAL[1], .20)},transparent 58%)}}</style>", unsafe_allow_html=True)
+    if r.get('maybe_perfume') and st.session_state.get('mp_done') != q:     # unknown short words: ask if it is a perfume name
+        st.info(L(f"Is “{q.strip()}” the name of a perfume?", f"آیا «{q.strip()}» اسم یک عطر است؟"))
+        b1, b2 = st.columns(2)
+        if b1.button(L("Yes, it's a perfume", "بله، اسم عطر است"), key='mp_yes_' + q):
+            fb.log_missing(st.session_state.user, q.strip(), None); st.session_state.mp_done = q; st.session_state.mp_yes = q
+            st.success(L("Thanks! We've noted it so we can add it. Below are perfumes for the closest mood; you can also describe how it smells.",
+                         "ممنون! یادداشتش کردیم تا اضافه‌اش کنیم. پایین عطرهایی برای نزدیک‌ترین حال‌وهوا آمده؛ می‌توانید بوی آن را هم توصیف کنید."))
+        if b2.button(L("No, it's my vibe", "نه، حال‌وهوای من است"), key='mp_no_' + q):
+            st.session_state.mp_done = q; st.rerun()
     if r['case'] == 'perfume':
         c = r['perfume_card']
         st.subheader(L(f"You like {c['name']} by {c['brand']}", f"شما {c['name']} از {c['brand']} را دوست دارید"))
@@ -208,14 +226,35 @@ if q.strip():
         items = r['similar_perfumes'][:3]
     else:
         if r['case'] in (1, 2):
-            st.subheader(L("Your vibe", "وایب شما") if r['case'] == 1 else L("Closest vibe we know", "نزدیک‌ترین وایبی که می‌شناسیم"))
+            near_exact = r['case'] == 1 or r.get('similarity', 0) >= 0.78     # >= 0.78 = practically the same vibe (calibrated 18 Nov 2026)
+            st.subheader(L("Your vibe", "وایب شما") if near_exact else L("Closest vibe we know", "نزدیک‌ترین وایبی که می‌شناسیم"))
+            if not near_exact:
+                st.info(L("Your exact vibe isn't in our library yet, so here is the most similar one we have. ✓ We've noted yours, so we can add it.",
+                          "وایب شما دقیقاً در کتابخانه‌ی ما نبود؛ این شبیه‌ترین وایبی است که داریم. ✓ وایب شما را یادداشت کردیم تا اضافه شود."))
+                if st.session_state.get('mv_q') != q:
+                    fb.log_missing_vibe(st.session_state.user, q.strip(), float(r.get('similarity', 0))); st.session_state.mv_q = q
             vibe_block(r['vibe'].split(' ', 1)[1], r['vibe_story'])
+        elif r.get('weak') and st.session_state.get('mp_yes') != q:       # nothing close enough: say so, show no forced perfumes
+            st.subheader(L("We don't have this vibe yet", "این وایب هنوز در کتابخانه‌ی ما نیست"))
+            if not (r.get('maybe_perfume') and st.session_state.get('mp_done') != q):
+                st.success(L("✓ We've noted it, so we can add it to our library.", "✓ یادداشتش کردیم تا به کتابخانه‌مان اضافه شود."))
+                if st.session_state.get('mv_q') != q:
+                    _ns = r.get('nearest_vibes') or [('', 0)]
+                    fb.log_missing_vibe(st.session_state.user, q.strip(), float(_ns[0][1])); st.session_state.mv_q = q
+            st.write(L("Rather than guess, we'd prefer to show nothing. Try describing it with a place, a season, a time of day or a smell, for example *a cold morning in the mountains* or *a warm evening with coffee and books*.",
+                       "ترجیح می‌دهیم به‌جای حدس زدن چیزی نشان ندهیم. با یک مکان، فصل، زمان روز یا یک بو توصیفش کنید؛ مثلاً *یک صبح سرد در کوهستان* یا *یک عصر گرم با قهوه و کتاب*."))
+            items = []
         else:
             st.subheader(L("We don't have this exact vibe - here are the closest ones", "این وایب دقیقاً در کتابخانه نیست؛ این‌ها نزدیک‌ترینند"))
-            if r.get('weak'): st.warning(L("This one is far from everything we know; treat it as a rough guess.", "این حال‌وهوا با همه‌ی چیزهایی که می‌شناسیم فاصله دارد؛ پیشنهاد فقط یک حدس تقریبی است."))
+            if st.session_state.get('mp_yes') != q and not (r.get('maybe_perfume') and st.session_state.get('mp_done') != q):   # a vibe the library is missing (wait while we ask if it is a perfume)
+                st.success(L("✓ We've noted this vibe, so we can add it to our library.", "✓ این وایب را یادداشت کردیم تا به کتابخانه‌مان اضافه شود."))
+                if st.session_state.get('mv_q') != q:
+                    _ns = r.get('nearest_vibes') or [('', 0)]
+                    fb.log_missing_vibe(st.session_state.user, q.strip(), float(_ns[0][1])); st.session_state.mv_q = q
             for t, s in r['nearest_vibe_stories']: vibe_block(t, s)
-        st.subheader(L("Your three perfumes", "سه عطر شما"))
-        items = r['perfumes']
+        if not (r['case'] == 3 and r.get('weak') and st.session_state.get('mp_yes') != q):
+            st.subheader(L("Your three perfumes", "سه عطر شما"))
+            items = r['perfumes']
     key = (q, str(gender))
     if st.session_state.get('last_q') != key:
         st.session_state.sid = fb.log_search(st.session_state.user, q.strip(), r); st.session_state.last_q = key
@@ -230,32 +269,43 @@ if q.strip():
             st.write(f"Gender filter: {r['gender_filter']}")
     st.divider()
     RATE = {"fits": L("fits", "می‌خورد"), "partly": L("partly", "تا حدی"), "no": L("no", "نمی‌خورد")}
-    with st.form(f"rate_{st.session_state.sid}"):
+    if items:
+      with st.form(f"rate_{st.session_state.sid}"):
         st.markdown(L("**Does each perfume fit the vibe you had in mind?**", "**آیا هر عطر با حال‌وهوایی که در ذهن داشتید می‌خورد؟**"))
         names = [x['perfume'] for x in items]
         picks = {n: st.radio(n, list(RATE), format_func=RATE.get, horizontal=True, key=f"{st.session_state.sid}{n}") for n in names}
+        WHY = {'sweet': L("too sweet", "زیادی شیرین"), 'heavy': L("too heavy", "زیادی سنگین"), 'light': L("too light", "زیادی سبک"),
+               'season': L("wrong season", "فصلش نمی‌خورد"), 'mood': L("wrong mood", "حس‌وحالش فرق دارد"), 'dislike': L("I know it and don't like it", "می‌شناسمش و دوستش ندارم")}
+        why = st.multiselect(L("If something did not fit, why? (optional)", "اگر چیزی نمی‌خورد، چرا؟ (اختیاری)"), list(WHY), format_func=WHY.get, key=f"why_{st.session_state.sid}")
         if st.form_submit_button(L("Send my rating", "ثبت نظر من")):
-            fb.log_ratings(st.session_state.sid, st.session_state.user, picks); st.success(L("Thank you!", "ممنون!"))
+            fb.log_ratings(st.session_state.sid, st.session_state.user, picks)
+            fb.log_reasons(st.session_state.sid, st.session_state.user, why); st.success(L("Thank you!", "ممنون!"))
 
 st.divider()
-with st.expander(L("Finished testing? Give us 2 minutes of feedback", "تست تمام شد؟ دو دقیقه نظرتان را بگویید")):
+with st.expander(L("Finished testing? Give us 2 minutes of feedback", "تست تمام شد؟ دو دقیقه نظرتان را بگویید"), expanded=bool(st.session_state.get('sid'))):
     YN = {"yes": L("yes", "بله"), "maybe": L("maybe", "شاید"), "no": L("no", "نه")}
     with st.form("survey"):
         score = st.slider(L("How close were the suggestions to your mood? (1 = not at all, 10 = perfectly)", "پیشنهادها چقدر به حال‌وهوای شما نزدیک بود؟ (۱ = اصلاً، ۱۰ = کاملاً)"), 1, 10, 7)
         how = st.text_input(L("How do you usually choose a perfume today?", "معمولاً چطور عطر انتخاب می‌کنید؟"))
         use = st.radio(L("Would you use a tool like this next time you buy perfume?", "دفعه‌ی بعد که عطر می‌خرید از چنین ابزاری استفاده می‌کنید؟"), list(YN), format_func=YN.get, horizontal=True)
-        wtp = st.text_input(L("If we sold a box of 3 samples matching your vibe, what would you pay? (a number, in USD)", "اگر یک جعبه‌ی ۳ نمونه‌ی مناسب وایب شما می‌فروختیم، چقدر می‌پرداختید؟ (یک عدد، به دلار)"))
+        WTP = {'none': L("I would not buy it", "نمی‌خریدم"), 'u15': L("under €15", "کمتر از ۱۵ یورو"), '15-25': "€15–25", '25-40': "€25–40", 'o40': L("over €40", "بیشتر از ۴۰ یورو"), 'unsure': L("not sure", "مطمئن نیستم")}
+        wtp = st.radio(L("A box of 3 small decants (3 × 3 ml) chosen for your vibe: what is the most you would pay, in euros?", "یک جعبه‌ی ۳ دکانت کوچک (۳ × ۳ میل) مناسب وایب شما: حداکثر چقدر می‌پرداختید، به یورو؟"),
+                       list(WTP), format_func=WTP.get, index=None, horizontal=True)
         miss = st.text_area(L("What was missing or wrong?", "چه چیزی کم یا اشتباه بود؟"))
         st.markdown("---")
-        st.caption(L("Optional. We only store your details if you tick the box, and only use them to credit your quote. You can ask us to delete them at any time.",
-                     "اختیاری. فقط اگر تیک بزنید اطلاعاتتان ذخیره می‌شود و فقط برای ذکر نام شما کنار نقل‌قول استفاده می‌شود. هر وقت بخواهید می‌توانید حذفش را بخواهید."))
-        consent = st.checkbox(L("You may quote my feedback with my name, role and links", "اجازه می‌دهم نظرم با نام، نقش و لینک‌هایم نقل شود"))
+        st.markdown(L("**Optional: tell us who you are**", "**اختیاری: خودتان را معرفی کنید**"))
+        st.caption(L("If you fill in these fields, we may quote your feedback with your name, role and links (for example on our website), "
+                     "and we may email you about VIBE, such as when our sample boxes launch. Leave them empty to stay anonymous. "
+                     "You can ask us to delete your details at any time: info@amirbolanda.com",
+                     "اگر این بخش را پر کنید، ممکن است نظرتان را با نام، نقش و لینک‌هایتان نقل کنیم (مثلاً در سایت‌مان) و درباره‌ی VIBE، مثلاً وقتی جعبه‌های نمونه آماده شد، به شما ایمیل بزنیم. "
+                     "برای ناشناس ماندن خالی بگذارید. هر وقت بخواهید می‌توانید حذف اطلاعاتتان را بخواهید: info@amirbolanda.com"))
         c1, c2 = st.columns(2)
         name = c1.text_input(L("Name", "نام")); role = c2.text_input(L("Role / city", "نقش / شهر"))
         email = c1.text_input(L("Email (optional)", "ایمیل (اختیاری)")); lin = c2.text_input(L("LinkedIn (optional)", "لینکدین (اختیاری)"))
         quote = st.text_area(L("A sentence we may quote (optional)", "یک جمله که می‌توانیم نقل کنیم (اختیاری)"))
         if st.form_submit_button(L("Submit feedback", "ارسال نظر")):
-            fb.log_survey(st.session_state.user, dict(score=score, how_choose=how, would_use=use, wtp=wtp, missing=miss, consent=consent,
+            consent = any(str(v).strip() for v in (name, role, email, lin, quote))     # filling the optional fields under the notice above = consent
+            fb.log_survey(st.session_state.user, dict(score=score, how_choose=how, would_use=use, wtp=wtp or '', missing=miss, consent=consent,
                           name=name, role=role, email=email, linkedin=lin, quote=quote)); st.success(L("Thank you - this really helps.", "ممنون؛ خیلی کمک می‌کند."))
 
 st.markdown("---")

@@ -18,8 +18,11 @@ metrics = {
  "'I'd like to try this' clicks": len(I), 'searches with a try-click': int(I.search_id.nunique()), 'testers who clicked try': int(I.user.nunique()),
  'repeat testers (>=3 searches)': int((S.groupby('user').size() >= 3).sum()),
 }
-wtp = pd.to_numeric(U.wtp.str.extract(r'(\d+(?:\.\d+)?)')[0], errors='coerce')
-metrics['median willingness to pay (sample box)'] = float(wtp.median()) if wtp.notna().any() else None
+WTP_KEYS = ['none', 'u15', '15-25', '25-40', 'o40', 'unsure']             # new fixed euro answers (old free-text answers are left out)
+metrics['willingness to pay, 3x3 ml box (new answers)'] = U.wtp[U.wtp.isin(WTP_KEYS)].value_counts().to_dict() or None
+tabs = [t[0] for t in c.execute("select name from sqlite_master where type='table'")]
+V = pd.read_sql('select * from visits', c) if 'visits' in tabs else pd.DataFrame(columns=['user', 'ts', 'grp', 'lang'])
+RS = pd.read_sql('select * from reasons', c) if 'reasons' in tabs else pd.DataFrame(columns=['search_id', 'user', 'ts', 'reasons'])
 by_case = m.groupby('case_').agg(searches=('id', 'size'), top3_hit=('any_fit', 'mean')).round(2).reset_index()
 bad = m[(m.any_fit == False) | (m.n.isna() & (m.case_ == '3'))][['when', 'query', 'case_', 'vibe']]      # missing-vibe candidates
 per_perfume = R.groupby('perfume').agg(times_shown=('rating', 'size'), fits=('rating', lambda x: (x == 'fits').sum()), no=('rating', lambda x: (x == 'no').sum())).sort_values('times_shown', ascending=False).reset_index()
@@ -31,4 +34,13 @@ with pd.ExcelWriter('feedback_report.xlsx') as w:
     S.drop(columns='ts').to_excel(w, sheet_name='All searches', index=False); U.drop(columns=['email', 'linkedin']).to_excel(w, sheet_name='Survey (no contact)', index=False)
     quotes.to_excel(w, sheet_name='Consented quotes', index=False)
     I.groupby('perfume').size().sort_values(ascending=False).rename('try clicks').reset_index().to_excel(w, sheet_name='Try-clicks per perfume', index=False)
+    if len(V):
+        g = V.merge(S.groupby('user').size().rename('searches').reset_index(), on='user', how='left').merge(U[['user', 'score', 'would_use']], on='user', how='left')
+        g.assign(grp=g.grp.replace('', '(no link group)')).groupby('grp').agg(visitors=('user', 'size'), searched=('searches', lambda x: int(x.notna().sum())),
+            surveys=('score', lambda x: int(x.notna().sum())), avg_score=('score', 'mean')).round(2).reset_index().to_excel(w, sheet_name='By link group', index=False)
+    MV = pd.read_sql('select * from missing_vibes', c) if 'missing_vibes' in tabs else pd.DataFrame(columns=['query'])
+    if len(MV):
+        MV.groupby('query').size().rename('times').sort_values(ascending=False).reset_index().to_excel(w, sheet_name='Vibes not in library', index=False)
+    if len(RS):
+        pd.Series([x for s in RS.reasons for x in json.loads(s)]).value_counts().rename('times').reset_index().to_excel(w, sheet_name='Why it did not fit', index=False)
     M.groupby('query').size().sort_values(ascending=False).rename('times searched').reset_index().to_excel(w, sheet_name='Perfumes not in library', index=False)

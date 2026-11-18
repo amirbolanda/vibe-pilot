@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS interest(ts REAL, user TEXT, search_id TEXT, perfume 
 CREATE TABLE IF NOT EXISTS ratings(search_id TEXT, user TEXT, ts REAL, perfume TEXT, rating TEXT);
 CREATE TABLE IF NOT EXISTS survey(user TEXT PRIMARY KEY, ts REAL, score INTEGER, how_choose TEXT, would_use TEXT,
   wtp TEXT, missing TEXT, consent INTEGER, name TEXT, role TEXT, email TEXT, linkedin TEXT, quote TEXT);
+CREATE TABLE IF NOT EXISTS reasons(search_id TEXT, user TEXT, ts REAL, reasons TEXT);
+CREATE TABLE IF NOT EXISTS missing_vibes(ts REAL, user TEXT, query TEXT, best_sim REAL);
+CREATE TABLE IF NOT EXISTS visits(user TEXT PRIMARY KEY, ts REAL, grp TEXT, lang TEXT);
 """
 def con(path=DB):
     c = sqlite3.connect(path); c.executescript(SCHEMA)
@@ -37,12 +40,26 @@ def log_ratings(sid, user, ratings, path=DB):        # ratings: {perfume: 'fits'
     persist.push_later(path)
 
 def log_survey(user, d, path=DB):
-    keep = d.get('consent', False)                   # contact details are stored ONLY with explicit consent
+    keep = d.get('consent', False)                   # contact details are stored only if the person filled them in under the notice in the form
     with con(path) as c:
         c.execute('INSERT OR REPLACE INTO survey VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                   (user, time.time(), d.get('score'), d.get('how_choose', ''), d.get('would_use', ''), d.get('wtp', ''), d.get('missing', ''),
                    int(keep), d.get('name', '') if keep else '', d.get('role', '') if keep else '', d.get('email', '') if keep else '',
                    d.get('linkedin', '') if keep else '', d.get('quote', '') if keep else ''))
+    persist.push_later(path)
+
+def log_reasons(sid, user, reasons, path=DB):      # why a perfume did not fit: 'too sweet', 'wrong season', ...
+    with con(path) as c:
+        c.execute('DELETE FROM reasons WHERE search_id=?', (sid,))
+        if reasons: c.execute('INSERT INTO reasons VALUES(?,?,?,?)', (sid, user, time.time(), json.dumps(reasons)))
+    persist.push_later(path)
+
+def log_visit(user, grp, lang, path=DB):            # which invitation link (?g=A) the tester came from
+    with con(path) as c: c.execute('INSERT OR IGNORE INTO visits VALUES(?,?,?,?)', (user, time.time(), grp or '', lang))
+    persist.push_later(path)
+
+def log_missing_vibe(user, query, best_sim, path=DB):  # vibes people describe that the library does not have yet
+    with con(path) as c: c.execute('INSERT INTO missing_vibes VALUES(?,?,?,?)', (time.time(), user, query, best_sim))
     persist.push_later(path)
 
 def log_missing(user, query, brand, path=DB):          # perfumes people look for that we do not have = demand signal

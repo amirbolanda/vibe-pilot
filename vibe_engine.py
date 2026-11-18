@@ -29,12 +29,13 @@ INACTIVE = ('Energy', 'Light-Dark')            # kept in the file, ignored in ra
 AX_FA = {'Thermal': 'گرمی', 'Freshness': 'طراوت', 'Sweetness': 'شیرینی', 'Dryness': 'خشکی',
          'Texture': 'بافت', 'Intensity': 'شدت', 'Natural-Urban': 'طبیعی-شهری',
          'Woody-Earthy': 'چوبی-خاکی', 'Floral': 'گلی', 'Fruity': 'میوه‌ای', 'Smoky-Spicy': 'دودی-ادویه‌ای'}
-MODEL = 'sentence-transformers/all-MiniLM-L6-v2'   # English-only MVP (small, fast, offline after first download)
+MODEL = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'   # multilingual: English + Persian (and later French/Arabic/German)
 
 # thresholds on cosine similarity (text -> vibe). TF-IDF values come from the 68-phrase test.
 # !! CALIBRATE the 'st' values with match_test.py and real phrases when the model is available !!
 THR = {'tfidf': {'case2': 0.20, 'case3_floor': 0.12},
-       'st':    {'case2': 0.55, 'case3_floor': 0.25}}
+       'st':    {'case2': 0.58, 'case3_floor': 0.50},
+       'fe':    {'case2': 0.58, 'case3_floor': 0.50}}   # calibrated 18 Nov 2026 on 46 real searches + 8 unrelated phrases: no unrelated phrase reaches 0.58
 
 # ---------------------------------------------------------------- Persian helpers
 def norm_fa(s):
@@ -152,9 +153,12 @@ def fa_perfume_to_en(q):
 def strip_acc(s): return ''.join(c for c in unicodedata.normalize('NFKD', str(s)) if not unicodedata.combining(c))
 
 def norm_en(s):
-    s = str(s).lower().replace('é', 'e').replace('è', 'e').replace('ï', 'i').replace('ô', 'o').replace('ò', 'o').replace('î', 'i').replace('û', 'u').replace('ë', 'e').replace('à', 'a').replace('ç', 'c').replace('°', ' ').replace('ò', 'o')
+    s = strip_acc(str(s).lower().replace('°', ' '))                       # Hermès -> hermes, Minérale -> minerale, any accent
     s = re.sub(r"[^a-z0-9&' ]", ' ', s)
     return re.sub(r'\s+', ' ', s).strip()
+
+NAME_STOP = {'d', 'de', 'des', 'du', 'l', 'la', 'le', 'les', 'by', 'and', '&', 'eau', 'parfum', 'edp', 'edt', 'pour', 'the', 's', 'secret', 'secrets'}
+def toks(s): return [t for t in re.split(r"[ ']+", norm_en(s)) if t and t not in NAME_STOP]
 
 COMMON = set('about after again along around before behind below beside between could every first great heart might never night other place quiet right should small smell still their there these thing think those three under until where which while whole would young'.split())
 STOP = {'le', 'la', 'l', 'the', 'eau', 'acqua', 'pour', 'les', 'un', 'my', 'black', 'light', 'sauvage'}
@@ -204,7 +208,15 @@ class Engine:
                 self.D = self.model.encode(self.doc, normalize_embeddings=True)
             except Exception as e:
                 if backend == 'st': raise
-                print('[engine] multilingual model not available -> TF-IDF fallback:', type(e).__name__)
+                print('[engine] sentence-transformers not available:', type(e).__name__)
+        if self.backend is None and backend in ('auto', 'fe'):
+            try:                                      # light AI backend: ONNX runtime, no torch -> fits Streamlit Cloud memory
+                from fastembed import TextEmbedding
+                self.model = TextEmbedding(MODEL); self.backend = 'fe'
+                self.D = self._fe_encode(self.doc)
+            except Exception as e:
+                if backend == 'fe': raise
+                print('[engine] fastembed not available -> TF-IDF fallback:', type(e).__name__)
         if self.backend is None:
             from sklearn.feature_extraction.text import TfidfVectorizer
             from sklearn.preprocessing import normalize
@@ -217,7 +229,13 @@ class Engine:
         self.thr = THR[self.backend]
 
     # ---- text -> similarity to every vibe
+    def _fe_encode(self, xs):
+        E = np.array(list(self.model.embed(list(xs))), dtype=np.float32)
+        return E / np.linalg.norm(E, axis=1, keepdims=True)
+
     def _sims(self, text):
+        if self.backend == 'fe':
+            return self.D @ self._fe_encode([text])[0]
         if self.backend == 'st':
             return self.D @ self.model.encode([text], normalize_embeddings=True)[0]
         t = strip_acc(fa_to_en(text) if is_fa(text) else text)
@@ -293,7 +311,24 @@ class Engine:
         if bs >= 0.9:                                   # contained name must make up most of the query
             cov = len(self.pname[best]) + (len(norm_en(self.p.at[best, 'Brand'])) if norm_en(self.p.at[best, 'Brand']) in qe else 0)
             if cov / max(len(qe), 1) < 0.6: return None  # 'sitting by the fireplace at night' is NOT the perfume 'By the Fireplace'
+        if bs < 0.84:                                   # word-order-free match: 'hermes terre', 'jo malone wood sage', 'terre'
+            t = self._token_match(qe)
+            if t: return t
         return (best, bs) if bs >= 0.84 else None
+
+    def _token_match(self, qe):
+        qt = toks(qe)
+        if not qt: return None
+        if len(qt) == 1 and (len(qt[0]) < 5 or qt[0] in self.vocab or qt[0] in COMMON): return None   # one vibe word is not a perfume
+        hit = lambda q, ft: any(f == q or (len(q) >= 4 and f.startswith(q)) for f in ft)
+        best, bs = None, 0
+        for i in range(len(self.p)):
+            nt, bt = toks(self.p.at[i, 'Name']), toks(self.p.at[i, 'Brand'])
+            if not nt or not all(hit(q, nt + bt) for q in qt): continue
+            if not any(hit(q, nt) for q in qt): continue            # at least one word of the perfume name, not only the brand
+            cov = sum(hit(n, qt) or any(q.startswith(n) for q in qt) for n in nt) / len(nt)
+            if cov > bs: best, bs = i, cov
+        return (best, round(0.85 + 0.1 * bs, 2)) if best is not None and bs >= 0.5 else None
 
     def similar_perfumes(self, i, k=5, fa=False):
         """vibes of perfume i = its own tags; similar perfumes = nearest on the 10 active axes
@@ -331,10 +366,14 @@ class Engine:
             t1, ch = self.fix_typos(text, self.name_vocab, 0.78) if (mode == 'perfume' or len(text.split()) <= 4) else (text, False)
             if ch and self.find_perfume(t1): text = t1
             else:
-                t2, ch2 = self.fix_typos(text)
+                t2, ch2 = self.fix_typos(text, cutoff=0.80 if self.backend == 'tfidf' else 0.90)   # the AI model copes with real words it has not seen ('hospital')
                 if ch2 and (mode == 'perfume' or float(self._sims(t2).max()) >= float(self._sims(text).max()) - 0.02): text = t2
         r = self._recommend(text, mode)
         if text != orig: r['corrected_query'] = text
+        if mode == 'auto' and r['case'] == 3 and not is_fa(orig):          # 'shiseido zen': maybe a perfume we do not know, not a vibe
+            words = re.findall(r"[a-z]+", norm_en(orig))
+            if 1 <= len(words) <= 3 and any(len(w) >= 3 and w not in self.vocab and w not in COMMON for w in words):
+                r['maybe_perfume'] = True
         r['gender_filter'] = gender
         if r['case'] not in ('perfume', 'perfume_missing'):                # how the text was matched (for debugging / transparency)
             sims = self._sims(text); top = np.argsort(-sims)[:3]
@@ -359,10 +398,17 @@ class Engine:
         qe = norm_en(fa_perfume_to_en(text) if is_fa(text) else text)
         sc = [max(difflib.SequenceMatcher(None, qe, n).ratio(), difflib.SequenceMatcher(None, qe, f).ratio()) for n, f in zip(self.pname, self.pfull)]
         close = [(self.lab[i], round(float(sc[i]), 2)) for i in np.argsort(sc)[::-1][:3] if sc[i] >= 0.5 and self._mask[i]]
-        brands = {norm_en(b): b for b in self.p.Brand.unique()}
-        bq = [b for nb, b in brands.items() if re.search(r'(?<![a-z0-9])' + re.escape(nb) + r'(?![a-z0-9])', qe)]
-        same = [self.lab[i] for i in range(len(self.p)) if self.p.at[i, 'Brand'] in bq and self._mask[i]][:5]
-        return {'case': 'perfume_missing', 'query': text, 'did_you_mean': close, 'brand': bq[0] if bq else None, 'same_brand': same}
+        qs = ' ' + ' '.join(toks(qe)) + ' '; bq, rest = [], toks(qe)
+        for b in self.p.Brand.unique():
+            bt = toks(b)
+            for k in ([bt] + ([bt[:2]] if len(bt) > 2 else [])):    # 'Jo Malone' finds 'Jo Malone London'
+                if k and ' ' + ' '.join(k) + ' ' in qs:
+                    if b not in bq: bq.append(b)
+                    rest = [t for t in rest if t not in k]
+                    break
+        same = [self.lab[i] for i in range(len(self.p)) if self.p.at[i, 'Brand'] in bq and self._mask[i]][:8]
+        return {'case': 'perfume_missing', 'query': text, 'did_you_mean': close, 'brand': bq[0] if bq else None, 'same_brand': same,
+                'brand_only': bool(bq) and not rest}
 
     def _recommend(self, text, mode='auto'):
         fa = is_fa(text) or getattr(self, '_lang_fa', False)
