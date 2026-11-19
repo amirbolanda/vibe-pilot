@@ -163,7 +163,9 @@ def toks(s): return [t for t in re.split(r"[ ']+", norm_en(s)) if t and t not in
 COMMON = set('about after again along around before behind below beside between could every first great heart might never night other place quiet right should small smell still their there these thing think those three under until where which while whole would young'.split())
 STOP = {'le', 'la', 'l', 'the', 'eau', 'acqua', 'pour', 'les', 'un', 'my', 'black', 'light', 'sauvage'}
 def fam(b, n):
-    w = re.findall(r"[a-zà-ÿ0-9]+", n.lower()); k = w[0] if w else n
+    w = re.findall(r"[a-zà-ÿ0-9]+", n.lower()); bw = re.findall(r"[a-zà-ÿ0-9]+", b.lower())
+    if len(w) > len(bw) and w[:len(bw)] == bw: w = w[len(bw):]          # 'Emporio Armani Stronger With You' -> 'stronger ...'
+    k = w[0] if w else n
     if k in STOP and len(w) > 1: k = ' '.join(w[:2])
     return b + '|' + k
 
@@ -412,6 +414,9 @@ class Engine:
 
     def _recommend(self, text, mode='auto'):
         fa = is_fa(text) or getattr(self, '_lang_fa', False)
+        if mode != 'perfume':                         # an exact vibe title beats a perfume name inside it ('A Night by the Fireplace')
+            t0 = norm_en(text)
+            if t0 in self.title_n: return self._vibe_result(1, [self.title_n.index(t0)], [1.0], text, fa)
         pf = self.find_perfume(text) if mode != 'vibe' else None
         if mode == 'perfume' and not pf: return self._missing_perfume(text)
         if mode == 'auto' and not pf and len(text.split()) <= 6:
@@ -454,8 +459,23 @@ class Engine:
             for k in (1, 2, 3):
                 lbl = self.v.at[j, f'Match {k}']
                 if lbl in self.lab: rows.append((self.lab.index(lbl), float(self.v.at[j, f'Match {k} Score'])))
-        else:                                     # gender filter -> same ranking formula, restricted to allowed perfumes
-            rows = self.rank_target(self.T[j], self.W[j], bonus={self.vid[j]: 1.5})
+        else:                                     # gender filter -> keep the hand-checked matches that pass, then fill with the
+            cur = []                              # perfumes most similar to those matches (not raw axis targets, which are coarse)
+            for k in (1, 2, 3):
+                lbl = self.v.at[j, f'Match {k}']
+                if lbl in self.lab and self._mask[self.lab.index(lbl)]: cur.append(self.lab.index(lbl))
+            seeds = [self.lab.index(self.v.at[j, f'Match {k}']) for k in (1, 2, 3) if self.v.at[j, f'Match {k}'] in self.lab]
+            used = {self.fams[i] for i in cur}
+            for i0 in seeds:
+                if len(cur) >= 3: break
+                for x in self.similar_perfumes(i0, k=6)[1]:
+                    i = self.lab.index(x['perfume'])
+                    if self.fams[i] not in used:
+                        cur.append(i); used.add(self.fams[i]); break
+            if len(cur) < 3:
+                cur += [i for i, _ in self.rank_target(self.T[j], self.W[j], bonus={self.vid[j]: 1.5}, exclude=used, k=3 - len(cur))]
+            sim = lambda i: float(1 - (self.W[j] * np.abs(self.T[j] - self.V[i])).sum() / (5 * self.W[j].sum()))
+            rows = [(i, sim(i)) for i in cur[:3]]
         return {'case': case, 'vibe': f"{int(self.v.at[j, 'ID'])} {self.v.at[j, 'Vibe Title']}", 'similarity': round(sims[0], 2), 'vibe_story': self.vstory[int(self.v.at[j, 'ID'])],
                 'perfumes': self._perf(rows, self.T[j], self.W[j], fa)}
 
